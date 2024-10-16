@@ -1,19 +1,51 @@
 import { NextResponse } from 'next/server';
+import { db } from '@/lib/firebase';
+import { collection, getDocs, addDoc, query, where } from 'firebase/firestore';
 
-let obligations = [
-  { id: 1, name: "Part-time Internship", icon: "Briefcase", timeSpent: 15, goal: 20 },
-  { id: 2, name: "Study", icon: "BookOpen", timeSpent: 10, goal: 15 },
-  { id: 3, name: "Exercise", icon: "Dumbbell", timeSpent: 3, goal: 5 },
-  { id: 4, name: "Personal Project", icon: "PenTool", timeSpent: 8, goal: 10 },
-];
+interface TimeEntry {
+  date: string;
+  duration: number;
+}
 
-export async function GET() {
-  return NextResponse.json(obligations);
+interface Obligation {
+  id: string;
+  name: string;
+  icon: string;
+  timeEntries: TimeEntry[];
+  goal: number;
+  userId: string;
+}
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const userId = searchParams.get('userId');
+
+  if (!userId) {
+    return NextResponse.json({ error: 'User ID is required' }, { status: 400 });
+  }
+
+  try {
+    const obligationsRef = collection(db, 'obligations');
+    const q = query(obligationsRef, where("userId", "==", userId));
+    const snapshot = await getDocs(q);
+    const obligations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Obligation));
+
+    return NextResponse.json(obligations);
+  } catch (error) {
+    console.error("Error fetching obligations:", error);
+    return NextResponse.json({ error: 'Failed to fetch obligations' }, { status: 500 });
+  }
 }
 
 export async function POST(request: Request) {
-  const newObligation = await request.json();
-  newObligation.id = obligations.length + 1;
-  obligations.push(newObligation);
-  return NextResponse.json(newObligation, { status: 201 });
+  try {
+    const newObligation = await request.json();
+    newObligation.timeEntries = [];
+
+    const docRef = await addDoc(collection(db, 'obligations'), newObligation);
+    return NextResponse.json({ id: docRef.id, ...newObligation }, { status: 201 });
+  } catch (error) {
+    console.error("Error adding obligation:", error);
+    return NextResponse.json({ error: 'Failed to add obligation' }, { status: 500 });
+  }
 }
