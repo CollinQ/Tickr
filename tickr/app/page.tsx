@@ -188,7 +188,7 @@ export default function Home() {
       name,
       icon: "Clock",
       timeEntries: [],
-      goal,
+      goal: goal,
       userId: user.uid
     };
 
