@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { User as FirebaseUser } from "firebase/auth";
-import { collection, query, where, getDocs, addDoc, updateDoc, doc } from "firebase/firestore";
+import { collection, query, where, getDocs, addDoc, updateDoc, doc, arrayUnion, deleteDoc, getDoc } from "firebase/firestore";
 import { 
   auth, 
   db, 
@@ -18,22 +18,24 @@ import { GoogleAuthProvider } from "firebase/auth";
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Progress } from "@/components/ui/progress"
 import { ObligationForm } from "@/components/ObligationForm"
-import { Clock, Plus, Settings, User } from "lucide-react"
+import { Clock, Plus, Settings, User, Trash2 } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
 import { useRouter } from 'next/navigation';
+import { Timestamp } from "firebase/firestore";
 
 interface TimeEntry {
-  date: string;
-  duration: number;
+  start: Timestamp;
+  end: Timestamp | null;
 }
 
 interface Obligation {
   id: string;
-  name: string;
-  icon: string;
+  obligationName: string;
+  goal: number;  // in minutes
+  userId: string;
   timeEntries: TimeEntry[];
-  goal: number;
+  lastResetDate: Timestamp;
 }
 
 export default function Home() {
@@ -51,6 +53,7 @@ export default function Home() {
   const [editingObligation, setEditingObligation] = useState<Obligation | null>(null);
   const [view, setView] = useState('dashboard');
   const router = useRouter();
+  const [timerStart, setTimerStart] = useState<Date | null>(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -70,23 +73,34 @@ export default function Home() {
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
-    if (isTimerRunning) {
+    if (isTimerRunning && timerStart) {
       interval = setInterval(() => {
-        setSessionTime((prevTime) => prevTime + 1);
+        const now = new Date();
+        setSessionTime(Math.floor((now.getTime() - timerStart.getTime()) / 1000));
       }, 1000);
-    } else if (!isTimerRunning && sessionTime !== 0) {
-      if (interval) clearInterval(interval);
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isTimerRunning, sessionTime]);
+  }, [isTimerRunning, timerStart]);
 
   const fetchObligations = async (userId: string) => {
     try {
       const q = query(collection(db, "obligations"), where("userId", "==", userId));
       const querySnapshot = await getDocs(q);
-      const fetchedObligations = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Obligation));
+      const fetchedObligations = await Promise.all(querySnapshot.docs.map(async doc => {
+        const data = doc.data();
+        const obligation = {
+          id: doc.id,
+          ...data,
+          timeEntries: data.timeEntries.map((entry: any) => ({
+            start: entry.start,
+            end: entry.end
+          })),
+          lastResetDate: data.lastResetDate || Timestamp.fromDate(getMostRecentMonday())
+        } as Obligation;
+        return await checkAndResetHours(obligation);
+      }));
       console.log("Fetched obligations:", fetchedObligations);
       setObligations(fetchedObligations);
     } catch (error) {
@@ -132,6 +146,9 @@ export default function Home() {
   };
 
   const handleSignOut = async () => {
+    if (isTimerRunning) {
+      await stopTimer();
+    }
     try {
       await signOut(auth);
     } catch (error: any) {
@@ -142,54 +159,53 @@ export default function Home() {
   const handleTimerToggle = async () => {
     if (!selectedObligation) return;
 
+    const now = new Date();
     const action = isTimerRunning ? 'stop' : 'start';
-    const response = await fetch('/api/timer', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ action, obligationId: selectedObligation.id }),
-    });
-    const data = await response.json();
 
-    if (action === 'stop' && data.duration) {
-      const sessionHours = sessionTime / 3600;
-      const updatedObligations = obligations.map(ob =>
-        ob.id === selectedObligation.id
-          ? { 
-              ...ob, 
-              timeEntries: [
-                ...ob.timeEntries, 
-                { date: new Date().toISOString().split('T')[0], duration: sessionHours }
-              ]
-            }
-          : ob
-      );
-      setObligations(updatedObligations);
-      setSelectedObligation({ 
-        ...selectedObligation, 
-        timeEntries: [
-          ...selectedObligation.timeEntries, 
-          { date: new Date().toISOString().split('T')[0], duration: sessionHours }
-        ]
-      });
-      setSessionTime(0);
-    } else if (action === 'start') {
-      setSessionTime(0);
+    try {
+      if (action === 'start') {
+        const newTimeEntry: TimeEntry = { start: Timestamp.fromDate(now), end: null };
+        await updateDoc(doc(db, "obligations", selectedObligation.id), {
+          timeEntries: arrayUnion(newTimeEntry)
+        });
+        setSelectedObligation({
+          ...selectedObligation,
+          timeEntries: [...selectedObligation.timeEntries, newTimeEntry]
+        });
+        setTimerStart(now);
+      } else {
+        const updatedTimeEntries = selectedObligation.timeEntries.map((entry, index) => {
+          if (index === selectedObligation.timeEntries.length - 1 && entry.end === null) {
+            return { ...entry, end: Timestamp.fromDate(now) };
+          }
+          return entry;
+        });
+        await updateDoc(doc(db, "obligations", selectedObligation.id), {
+          timeEntries: updatedTimeEntries
+        });
+        setSelectedObligation({
+          ...selectedObligation,
+          timeEntries: updatedTimeEntries
+        });
+        setTimerStart(null);
+        setSessionTime(0);
+      }
+      setIsTimerRunning(!isTimerRunning);
+    } catch (error) {
+      console.error("Error updating timer:", error);
+      setError("Failed to update timer. Please try again.");
     }
-
-    setIsTimerRunning(!isTimerRunning);
   };
 
   const addObligation = async (name: string, goal: number) => {
     if (!user) return;
 
-    const newObligation = {
-      name,
-      icon: "Clock",
+    const newObligation: Omit<Obligation, 'id'> = {
+      obligationName: name,
+      goal: goal * 60,  // Convert hours to minutes
+      userId: user.uid,
       timeEntries: [],
-      goal: goal,
-      userId: user.uid
+      lastResetDate: Timestamp.fromDate(getMostRecentMonday()) // Set initial reset date to most recent Monday
     };
 
     try {
@@ -208,8 +224,10 @@ export default function Home() {
 
     const updatedObligation = {
       ...editingObligation,
-      name,
-      goal
+      obligationName: name,
+      goal: goal * 60, // Convert hours to minutes
+      // Ensure timeEntries is maintained
+      timeEntries: editingObligation.timeEntries || []
     };
 
     try {
@@ -223,8 +241,33 @@ export default function Home() {
     }
   };
 
-  const selectObligation = (obligation: Obligation) => {
-    setSelectedObligation(obligation);
+  const selectObligation = async (obligation: Obligation) => {
+    if (isTimerRunning) {
+      await stopTimer();
+    }
+    try {
+      const docRef = doc(db, "obligations", obligation.id);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        let updatedObligation = {
+          ...obligation,
+          timeEntries: data.timeEntries.map((entry: any) => ({
+            start: entry.start,
+            end: entry.end
+          })),
+          lastResetDate: data.lastResetDate || Timestamp.fromDate(new Date())
+        };
+        updatedObligation = await checkAndResetHours(updatedObligation);
+        setSelectedObligation(updatedObligation);
+        setView('obligation');
+      } else {
+        console.log("No such document!");
+      }
+    } catch (error) {
+      console.error("Error fetching obligation: ", error);
+      setError("Failed to fetch obligation details. Please try again.");
+    }
   };
 
   const formatTime = (time: number) => {
@@ -233,27 +276,44 @@ export default function Home() {
     return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  const resetView = () => {
+  const resetView = async () => {
+    if (isTimerRunning) {
+      await stopTimer();
+    }
     setSelectedObligation(null);
     setView('dashboard');
   };
 
   const generateWeeklyData = () => {
-    const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     const today = new Date();
-    const weekStart = new Date(today.setDate(today.getDate() - today.getDay() + 1));
-    
+    const currentDay = today.getDay();
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - currentDay);
+    weekStart.setHours(0, 0, 0, 0);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 7);
+
     return days.map((day, index) => {
       const date = new Date(weekStart);
-      date.setDate(date.getDate() + index);
-      const dateString = date.toISOString().split('T')[0];
-
+      date.setDate(weekStart.getDate() + index);
       const dayData: { [key: string]: string | number } = { name: day };
+      
       obligations.forEach(obligation => {
-        const timeSpent = obligation.timeEntries
-          .filter(entry => entry.date === dateString)
-          .reduce((sum, entry) => sum + entry.duration, 0);
-        dayData[obligation.name] = timeSpent;
+        const timeSpentMs = obligation.timeEntries
+          ? obligation.timeEntries
+              .filter(entry => {
+                const entryDate = entry.start.toDate();
+                return entryDate >= weekStart && entryDate < weekEnd;
+              })
+              .reduce((sum, entry) => {
+                const startTime = entry.start.toDate();
+                const endTime = entry.end ? entry.end.toDate() : new Date();
+                const duration = endTime.getTime() - startTime.getTime();
+                return sum + (startTime.toDateString() === date.toDateString() ? duration : 0);
+              }, 0)
+          : 0;
+        dayData[obligation.obligationName] = timeSpentMs / (1000 * 60 * 60); // Convert to hours
       });
       return dayData;
     });
@@ -269,12 +329,108 @@ export default function Home() {
       "hsl(var(--chart-6))",
     ];
     return obligations.reduce((config: Record<string, any>, obligation, index) => {
-      config[obligation.name] = {
-        label: obligation.name,
+      config[obligation.obligationName] = {
+        label: obligation.obligationName,
         color: colors[index % colors.length],
       };
       return config;
     }, {});
+  };
+
+  const calculateTotalTime = (timeEntries: TimeEntry[] | undefined): number => {
+    if (!timeEntries || !Array.isArray(timeEntries)) {
+      return 0;
+    }
+    return timeEntries.reduce((total, entry) => {
+      const end = entry.end || Timestamp.now();
+      return total + (end.toMillis() - entry.start.toMillis()) / 60000; // Convert to minutes
+    }, 0);
+  };
+
+  const deleteObligation = async (obligationId: string) => {
+    if (!user) return;
+
+    try {
+      await deleteDoc(doc(db, "obligations", obligationId));
+      setObligations(prevObligations => prevObligations.filter(ob => ob.id !== obligationId));
+      if (selectedObligation?.id === obligationId) {
+        setSelectedObligation(null);
+        setView('dashboard');
+      }
+    } catch (error) {
+      console.error("Error deleting obligation: ", error);
+      setError("Failed to delete obligation. Please try again.");
+    }
+  };
+
+  // Add this helper function to format duration
+  const formatDuration = (durationInMillis: number) => {
+    const hours = Math.floor(durationInMillis / (1000 * 60 * 60));
+    const minutes = Math.floor((durationInMillis % (1000 * 60 * 60)) / (1000 * 60));
+    const seconds = Math.floor((durationInMillis % (1000 * 60)) / 1000);
+    return `${hours}h ${minutes}m ${seconds}s`;
+  };
+
+  const stopTimer = async () => {
+    if (!selectedObligation || !isTimerRunning) return;
+
+    const now = new Date();
+    try {
+      const updatedTimeEntries = selectedObligation.timeEntries.map((entry, index) => {
+        if (index === selectedObligation.timeEntries.length - 1 && entry.end === null) {
+          return { ...entry, end: Timestamp.fromDate(now) };
+        }
+        return entry;
+      });
+      await updateDoc(doc(db, "obligations", selectedObligation.id), {
+        timeEntries: updatedTimeEntries
+      });
+      setSelectedObligation({
+        ...selectedObligation,
+        timeEntries: updatedTimeEntries
+      });
+      setTimerStart(null);
+      setSessionTime(0);
+      setIsTimerRunning(false);
+    } catch (error) {
+      console.error("Error stopping timer:", error);
+      setError("Failed to stop timer. Please try again.");
+    }
+  };
+
+  const checkAndResetHours = async (obligation: Obligation) => {
+    const now = new Date();
+    const lastReset = obligation.lastResetDate.toDate();
+    const nextResetDate = new Date(lastReset);
+    nextResetDate.setDate(nextResetDate.getDate() + 7); // Next reset should be 7 days after the last reset
+
+    if (now >= nextResetDate) {
+      const newResetDate = getMostRecentMonday();
+
+      const updatedObligation = {
+        ...obligation,
+        timeEntries: [],
+        lastResetDate: Timestamp.fromDate(newResetDate)
+      };
+
+      try {
+        await updateDoc(doc(db, "obligations", obligation.id), updatedObligation);
+        return updatedObligation;
+      } catch (error) {
+        console.error("Error resetting hours:", error);
+        return obligation;
+      }
+    }
+
+    return obligation;
+  };
+
+  const getMostRecentMonday = () => {
+    const now = new Date();
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (now.getDay() + 6) % 7);
+    monday.setHours(0, 1, 0, 0); // Set to 12:01 AM
+    return monday;
   };
 
   if (isLoading) {
@@ -301,8 +457,17 @@ export default function Home() {
                     onClick={() => selectObligation(obligation)}
                   >
                     <Clock className="mr-2 h-4 w-4" />
-                    {obligation.name}
-                    <span className="ml-auto">{Math.floor(obligation.timeEntries.reduce((sum, entry) => sum + entry.duration, 0))}h</span>
+                    {obligation.obligationName}
+                    <span className="ml-auto">
+                      {obligation.timeEntries && Array.isArray(obligation.timeEntries)
+                        ? Math.floor(obligation.timeEntries.reduce((sum, entry) => {
+                            const duration = entry.end 
+                              ? (entry.end.toMillis() - entry.start.toMillis()) / (1000 * 60 * 60) 
+                              : 0;
+                            return sum + duration;
+                          }, 0))
+                        : 0}h
+                    </span>
                   </Button>
                 ))}
               </div>
@@ -326,6 +491,11 @@ export default function Home() {
                   <h2 className="text-3xl font-bold">Dashboard</h2>
                   <div className="rounded-lg bg-white p-6 shadow-sm">
                     <h3 className="mb-4 text-xl font-semibold">Weekly Overview</h3>
+                    <p className="mb-2 text-sm text-gray-500">
+                      {new Date(new Date().setDate(new Date().getDate() - new Date().getDay())).toLocaleDateString()} 
+                      - 
+                      {new Date(new Date().setDate(new Date().getDate() - new Date().getDay() + 6)).toLocaleDateString()}
+                    </p>
                     <ChartContainer
                       config={generateChartConfig()}
                       className="h-[300px]"
@@ -334,14 +504,35 @@ export default function Home() {
                         <BarChart data={generateWeeklyData()}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis />
-                          <ChartTooltip content={<ChartTooltipContent />} />
+                          <YAxis 
+                            tickFormatter={(value) => `${Math.floor(value)}h`} 
+                            label={{ value: 'Hours', angle: -90, position: 'insideLeft' }}
+                            domain={[0, 8]}  // Set the domain from 0 to 8 hours
+                            ticks={[0, 2, 4, 6, 8]}  // Specify the ticks we want to see
+                          />
+                          <ChartTooltip 
+                            content={({ active, payload, label }) => {
+                              if (active && payload && payload.length) {
+                                return (
+                                  <div className="bg-white p-2 border border-gray-300 rounded shadow">
+                                    <p className="font-bold">{label}</p>
+                                    {payload.map((entry: any, index: number) => (
+                                      <p key={index} style={{ color: entry.color }}>
+                                        {entry.name}: {Number(entry.value).toFixed(2)} hours
+                                      </p>
+                                    ))}
+                                  </div>
+                                );
+                              }
+                              return null;
+                            }}
+                          />
                           {obligations.map((obligation) => (
                             <Bar 
                               key={obligation.id}
-                              dataKey={obligation.name}
+                              dataKey={obligation.obligationName}
                               stackId="a"
-                              fill={`var(--color-${obligation.name.replace(/\s+/g, '-')})`}
+                              fill={`var(--color-${obligation.obligationName.replace(/\s+/g, '-')})`}
                             />
                           ))}
                         </BarChart>
@@ -352,7 +543,7 @@ export default function Home() {
                     <div className="rounded-lg bg-white p-6 shadow-sm">
                       <h3 className="mb-2 text-xl font-semibold">Total Time Tracked</h3>
                       <p className="text-3xl font-bold">
-                        {obligations.reduce((sum, ob) => sum + ob.timeEntries.reduce((subSum, entry) => subSum + entry.duration, 0), 0).toFixed(2)} hours
+                        {obligations.reduce((sum, ob) => sum + calculateTotalTime(ob.timeEntries) / 60, 0).toFixed(2)} hours
                       </p>
                       <p className="text-sm text-gray-500">this week</p>
                     </div>
@@ -362,9 +553,19 @@ export default function Home() {
                     </div>
                   </div>
                 </div>
-              ) : selectedObligation ? (
+              ) : selectedObligation && view === 'obligation' ? (
                 <div className="space-y-6">
-                  <h2 className="text-3xl font-bold">{selectedObligation.name}</h2>
+                  <div className="flex justify-between items-center">
+                    <h2 className="text-3xl font-bold">{selectedObligation.obligationName}</h2>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => deleteObligation(selectedObligation.id)}
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Delete
+                    </Button>
+                  </div>
                   <div className="flex items-center justify-center">
                     <div className="relative h-64 w-64 rounded-full border-8 border-gray-200">
                       <div className="absolute inset-0 flex items-center justify-center">
@@ -382,25 +583,35 @@ export default function Home() {
                   </div>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <span>Goal: {selectedObligation.goal} hours/week</span>
+                      <span>Goal: {selectedObligation.goal / 60} hours/week</span>
                       <span>
-                        {selectedObligation.timeEntries.reduce((sum, entry) => sum + entry.duration, 0).toFixed(2)}/{selectedObligation.goal} hours
+                        {(calculateTotalTime(selectedObligation.timeEntries) / 60).toFixed(2)}/{selectedObligation.goal / 60} hours
                       </span>
                     </div>
-                    <Progress value={(selectedObligation.timeEntries.reduce((sum, entry) => sum + entry.duration, 0) / selectedObligation.goal) * 100} />
+                    <Progress value={(calculateTotalTime(selectedObligation.timeEntries) / selectedObligation.goal) * 100} />
                   </div>
                   <div>
                     <h3 className="mb-2 text-lg font-semibold">Recent Time Entries</h3>
                     <div className="space-y-2">
-                      {selectedObligation.timeEntries.slice(-3).reverse().map((entry, i) => (
-                        <div key={i} className="flex items-center justify-between rounded-lg bg-white p-3 shadow-sm">
-                          <div className="flex items-center">
-                            <Clock className="mr-2 h-4 w-4 text-gray-500" />
-                            <span>{entry.duration.toFixed(2)} hours</span>
-                          </div>
-                          <span className="text-sm text-gray-500">{entry.date}</span>
-                        </div>
-                      ))}
+                      {selectedObligation.timeEntries && selectedObligation.timeEntries.length > 0 ? (
+                        selectedObligation.timeEntries
+                          .filter(entry => entry.end !== null)
+                          .sort((a, b) => b.end!.toMillis() - a.end!.toMillis()) // Sort by end time, most recent first
+                          .slice(0, 3) // Take the 3 most recent entries
+                          .map((entry, i) => (
+                            <div key={i} className="flex items-center justify-between rounded-lg bg-white p-3 shadow-sm">
+                              <div className="flex items-center">
+                                <Clock className="mr-2 h-4 w-4 text-gray-500" />
+                                <span>{formatDuration(entry.end!.toMillis() - entry.start.toMillis())}</span>
+                              </div>
+                              <span className="text-sm text-gray-500">
+                                {entry.start.toDate().toLocaleDateString()} {entry.start.toDate().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                              </span>
+                            </div>
+                          ))
+                      ) : (
+                        <p>No completed time entries yet.</p>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -425,8 +636,8 @@ export default function Home() {
                 <ObligationForm
                   onSubmit={editObligation}
                   onCancel={() => setIsEditModalOpen(false)}
-                  initialName={editingObligation.name}
-                  initialGoal={editingObligation.goal}
+                  initialName={editingObligation.obligationName}
+                  initialGoal={editingObligation.goal / 60} // Convert minutes back to hours
                 />
               </div>
             </div>

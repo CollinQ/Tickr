@@ -1,19 +1,18 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/firebase';
-import { collection, getDocs, addDoc, query, where } from 'firebase/firestore';
+import { collection, getDocs, addDoc, query, where, Timestamp } from 'firebase/firestore';
 
 interface TimeEntry {
-  date: string;
-  duration: number;
+  start: Timestamp;
+  end: Timestamp | null;
 }
 
 interface Obligation {
   id: string;
-  name: string;
-  icon: string;
-  timeEntries: TimeEntry[];
+  obligationName: string;
   goal: number;
   userId: string;
+  timeEntries: TimeEntry[];
 }
 
 export async function GET(request: Request) {
@@ -40,7 +39,8 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const newObligation = await request.json();
-    newObligation.timeEntries = [];
+    newObligation.timeEntries = [];  // Ensure timeEntries is initialized
+    newObligation.goal = newObligation.goal * 60; // Convert hours to minutes
 
     const docRef = await addDoc(collection(db, 'obligations'), newObligation);
     return NextResponse.json({ id: docRef.id, ...newObligation }, { status: 201 });
