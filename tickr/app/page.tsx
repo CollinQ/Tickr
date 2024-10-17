@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { User as FirebaseUser } from "firebase/auth";
 import { collection, query, where, getDocs, addDoc, updateDoc, doc, arrayUnion, deleteDoc, getDoc } from "firebase/firestore";
 import { 
@@ -19,10 +19,11 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Progress } from "@/components/ui/progress"
 import { ObligationForm } from "@/components/ObligationForm"
 import { Clock, Plus, Settings, User, Trash2 } from "lucide-react"
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip, TooltipProps } from "recharts"
+import { ChartContainer } from "@/components/ui/chart"
 import { useRouter } from 'next/navigation';
 import { Timestamp } from "firebase/firestore";
+import { FirebaseError } from 'firebase/app';
 
 interface TimeEntry {
   start: Timestamp;
@@ -36,6 +37,24 @@ interface Obligation {
   userId: string;
   timeEntries: TimeEntry[];
   lastResetDate: Timestamp;
+}
+
+interface FirestoreTimeEntry {
+  start: Timestamp;
+  end: Timestamp | null;
+}
+
+interface FirestoreObligation {
+  obligationName: string;
+  goal: number;
+  userId: string;
+  timeEntries: FirestoreTimeEntry[];
+  lastResetDate: Timestamp;
+}
+
+// Add this near the top of your file, with other interfaces
+interface CustomError {
+  message: string;
 }
 
 export default function Home() {
@@ -55,6 +74,89 @@ export default function Home() {
   const router = useRouter();
   const [timerStart, setTimerStart] = useState<Date | null>(null);
 
+  const getMostRecentMonday = useCallback(() => {
+    const now = new Date();
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (now.getDay() + 6) % 7);
+    monday.setHours(0, 1, 0, 0); // Set to 12:01 AM
+    return monday;
+  }, []);
+
+  const checkAndResetHours = useCallback(async (obligation: Obligation) => {
+    const now = new Date();
+    const lastReset = obligation.lastResetDate.toDate();
+    const nextResetDate = new Date(lastReset);
+    nextResetDate.setDate(nextResetDate.getDate() + 7);
+
+    if (now >= nextResetDate) {
+      const newResetDate = getMostRecentMonday();
+
+      const updatedObligation = {
+        ...obligation,
+        timeEntries: [],
+        lastResetDate: Timestamp.fromDate(newResetDate)
+      };
+
+      try {
+        await updateDoc(doc(db, "obligations", obligation.id), updatedObligation);
+        return updatedObligation;
+      } catch (error) {
+        console.error("Error resetting hours:", error);
+        return obligation;
+      }
+    }
+
+    return obligation;
+  }, [getMostRecentMonday]);
+
+  const fetchObligations = useCallback(async (userId: string) => {
+    try {
+      const q = query(collection(db, "obligations"), where("userId", "==", userId));
+      const querySnapshot = await getDocs(q);
+      const fetchedObligations = await Promise.all(querySnapshot.docs.map(async doc => {
+        const data = doc.data() as FirestoreObligation | undefined;
+        if (!data) {
+          throw new Error(`No data found for obligation with ID: ${doc.id}`);
+        }
+        const obligation: Obligation = {
+          id: doc.id,
+          ...data,
+          timeEntries: data.timeEntries.map((entry: FirestoreTimeEntry) => ({
+            start: entry.start,
+            end: entry.end
+          })),
+          lastResetDate: data.lastResetDate || Timestamp.fromDate(getMostRecentMonday())
+        };
+        return await checkAndResetHours(obligation);
+      }));
+      console.log("Fetched obligations:", fetchedObligations);
+      setObligations(fetchedObligations);
+    } catch (error) {
+      console.error("Error fetching obligations: ", error);
+      setError("Failed to fetch obligations. Please try again.");
+    }
+  }, [checkAndResetHours]); // Add checkAndResetHours to the dependency array
+
+  const handleGoogleSignIn = useCallback(async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({
+        prompt: 'select_account'
+      });
+      const result = await signInWithPopup(auth, provider);
+      console.log("Google Sign-In successful", result.user);
+      setError("");
+      router.push('/'); // Redirect to home page after successful sign-in
+    } catch (error: unknown) {
+      console.error("Google Sign-In Error:", error);
+      if (error instanceof FirebaseError || (error as CustomError).message) {
+        setError((error as CustomError).message);
+      } else {
+        setError("An unknown error occurred");
+      }
+    }
+  }, [router]);
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       console.log("Auth state changed", user);
@@ -62,14 +164,13 @@ export default function Home() {
       if (user) {
         fetchObligations(user.uid);
       } else {
-        // Redirect to Google Sign-In if user is not logged in
         handleGoogleSignIn();
       }
       setIsLoading(false);
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [fetchObligations, handleGoogleSignIn]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
@@ -84,38 +185,17 @@ export default function Home() {
     };
   }, [isTimerRunning, timerStart]);
 
-  const fetchObligations = async (userId: string) => {
-    try {
-      const q = query(collection(db, "obligations"), where("userId", "==", userId));
-      const querySnapshot = await getDocs(q);
-      const fetchedObligations = await Promise.all(querySnapshot.docs.map(async doc => {
-        const data = doc.data();
-        const obligation = {
-          id: doc.id,
-          ...data,
-          timeEntries: data.timeEntries.map((entry: any) => ({
-            start: entry.start,
-            end: entry.end
-          })),
-          lastResetDate: data.lastResetDate || Timestamp.fromDate(getMostRecentMonday())
-        } as Obligation;
-        return await checkAndResetHours(obligation);
-      }));
-      console.log("Fetched obligations:", fetchedObligations);
-      setObligations(fetchedObligations);
-    } catch (error) {
-      console.error("Error fetching obligations: ", error);
-      setError("Failed to fetch obligations. Please try again.");
-    }
-  };
-
   const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       await createUserWithEmailAndPassword(auth, email, password);
       setError("");
-    } catch (error: any) {
-      setError(error.message);
+    } catch (error: unknown) {
+      if (error instanceof FirebaseError || (error as CustomError).message) {
+        setError((error as CustomError).message);
+      } else {
+        setError("An unknown error occurred during sign up");
+      }
     }
   };
 
@@ -124,24 +204,12 @@ export default function Home() {
     try {
       await signInWithEmailAndPassword(auth, email, password);
       setError("");
-    } catch (error: any) {
-      setError(error.message);
-    }
-  };
-
-  const handleGoogleSignIn = async () => {
-    try {
-      const provider = new GoogleAuthProvider();
-      provider.setCustomParameters({
-        prompt: 'select_account'
-      });
-      const result = await signInWithPopup(auth, provider);
-      console.log("Google Sign-In successful", result.user);
-      setError("");
-      router.push('/'); // Redirect to home page after successful sign-in
-    } catch (error: any) {
-      console.error("Google Sign-In Error:", error);
-      setError(error.message);
+    } catch (error: unknown) {
+      if (error instanceof FirebaseError || (error as CustomError).message) {
+        setError((error as CustomError).message);
+      } else {
+        setError("An unknown error occurred during sign in");
+      }
     }
   };
 
@@ -151,8 +219,12 @@ export default function Home() {
     }
     try {
       await signOut(auth);
-    } catch (error: any) {
-      setError(error.message);
+    } catch (error: unknown) {
+      if (error instanceof FirebaseError || (error as CustomError).message) {
+        setError((error as CustomError).message);
+      } else {
+        setError("An unknown error occurred during sign out");
+      }
     }
   };
 
@@ -252,7 +324,7 @@ export default function Home() {
         const data = docSnap.data();
         let updatedObligation = {
           ...obligation,
-          timeEntries: data.timeEntries.map((entry: any) => ({
+          timeEntries: data.timeEntries.map((entry: TimeEntry) => ({
             start: entry.start,
             end: entry.end
           })),
@@ -302,18 +374,18 @@ export default function Home() {
       obligations.forEach(obligation => {
         const timeSpentMs = obligation.timeEntries
           ? obligation.timeEntries
-              .filter(entry => {
+              .filter((entry: TimeEntry) => {
                 const entryDate = entry.start.toDate();
                 return entryDate >= weekStart && entryDate < weekEnd;
               })
-              .reduce((sum, entry) => {
+              .reduce((sum: number, entry: TimeEntry) => {
                 const startTime = entry.start.toDate();
                 const endTime = entry.end ? entry.end.toDate() : new Date();
                 const duration = endTime.getTime() - startTime.getTime();
                 return sum + (startTime.toDateString() === date.toDateString() ? duration : 0);
               }, 0)
           : 0;
-        dayData[obligation.obligationName] = timeSpentMs / (1000 * 60 * 60); // Convert to hours
+        dayData[obligation.obligationName] = timeSpentMs / (1000 * 60 * 60);
       });
       return dayData;
     });
@@ -328,7 +400,7 @@ export default function Home() {
       "hsl(var(--chart-5))",
       "hsl(var(--chart-6))",
     ];
-    return obligations.reduce((config: Record<string, any>, obligation, index) => {
+    return obligations.reduce((config: Record<string, { label: string; color: string }>, obligation, index) => {
       config[obligation.obligationName] = {
         label: obligation.obligationName,
         color: colors[index % colors.length],
@@ -396,41 +468,6 @@ export default function Home() {
       console.error("Error stopping timer:", error);
       setError("Failed to stop timer. Please try again.");
     }
-  };
-
-  const checkAndResetHours = async (obligation: Obligation) => {
-    const now = new Date();
-    const lastReset = obligation.lastResetDate.toDate();
-    const nextResetDate = new Date(lastReset);
-    nextResetDate.setDate(nextResetDate.getDate() + 7); // Next reset should be 7 days after the last reset
-
-    if (now >= nextResetDate) {
-      const newResetDate = getMostRecentMonday();
-
-      const updatedObligation = {
-        ...obligation,
-        timeEntries: [],
-        lastResetDate: Timestamp.fromDate(newResetDate)
-      };
-
-      try {
-        await updateDoc(doc(db, "obligations", obligation.id), updatedObligation);
-        return updatedObligation;
-      } catch (error) {
-        console.error("Error resetting hours:", error);
-        return obligation;
-      }
-    }
-
-    return obligation;
-  };
-
-  const getMostRecentMonday = () => {
-    const now = new Date();
-    const monday = new Date(now);
-    monday.setDate(now.getDate() - (now.getDay() + 6) % 7);
-    monday.setHours(0, 1, 0, 0); // Set to 12:01 AM
-    return monday;
   };
 
   if (isLoading) {
@@ -510,15 +547,16 @@ export default function Home() {
                             domain={[0, 8]}  // Set the domain from 0 to 8 hours
                             ticks={[0, 2, 4, 6, 8]}  // Specify the ticks we want to see
                           />
-                          <ChartTooltip 
-                            content={({ active, payload, label }) => {
+                          <Tooltip 
+                            content={(props: TooltipProps<number, string>) => {
+                              const { active, payload, label } = props;
                               if (active && payload && payload.length) {
                                 return (
                                   <div className="bg-white p-2 border border-gray-300 rounded shadow">
                                     <p className="font-bold">{label}</p>
-                                    {payload.map((entry: any, index: number) => (
+                                    {payload.map((entry, index) => (
                                       <p key={index} style={{ color: entry.color }}>
-                                        {entry.name}: {Number(entry.value).toFixed(2)} hours
+                                        {entry.name}: {entry.value?.toFixed(2)} hours
                                       </p>
                                     ))}
                                   </div>
