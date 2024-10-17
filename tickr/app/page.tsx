@@ -1,24 +1,21 @@
 "use client"
 
-import { useState, useEffect, useCallback, useMemo } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { User as FirebaseUser } from "firebase/auth";
 import { collection, query, where, getDocs, addDoc, updateDoc, doc, arrayUnion, deleteDoc, getDoc } from "firebase/firestore";
 import { 
   auth, 
   db, 
-  createUserWithEmailAndPassword, 
-  signInWithEmailAndPassword, 
   signOut, 
   onAuthStateChanged,
   signInWithPopup
 } from "@/lib/firebase";
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { GoogleAuthProvider } from "firebase/auth";
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Progress } from "@/components/ui/progress"
 import { ObligationForm } from "@/components/ObligationForm"
-import { Clock, Plus, Settings, User, Trash2, LogOut } from "lucide-react"
+import { Clock, Plus, Settings, Trash2, LogOut } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip, TooltipProps } from "recharts"
 import { ChartContainer } from "@/components/ui/chart"
 import { useRouter } from 'next/navigation';
@@ -71,10 +68,7 @@ export default function Home() {
   const [view, setView] = useState('dashboard');
   const router = useRouter();
   const [timerStart, setTimerStart] = useState<Date | null>(null);
-
-  const timerProgress = useMemo(() => {
-    return (sessionTime % 60) / 60;
-  }, [sessionTime]);
+  const [timerProgress, setTimerProgress] = useState(0);
 
   const getMostRecentMonday = useCallback(() => {
     const now = new Date();
@@ -177,7 +171,9 @@ export default function Home() {
     if (isTimerRunning && timerStart) {
       interval = setInterval(() => {
         const now = new Date();
-        setSessionTime(Math.floor((now.getTime() - timerStart.getTime()) / 1000));
+        const elapsedSeconds = Math.floor((now.getTime() - timerStart.getTime()) / 1000);
+        setSessionTime(elapsedSeconds);
+        setTimerProgress((elapsedSeconds % 60) / 60);
       }, 1000);
     }
     return () => {
