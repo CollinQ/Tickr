@@ -21,11 +21,9 @@ export function ObligationForm({ onSubmit, onCancel, initialName = '', initialGo
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const goalNumber = parseInt(goal, 10);
+    const goalNumber = parseFloat(goal);
     if (name && !isNaN(goalNumber) && goalNumber > 0) {
-      console.log('Submitting form:', { name, goal: goalNumber });
       onSubmit(name, goalNumber);
-      onCancel(); // Close the modal after submission
     }
   };
 
@@ -50,7 +48,8 @@ export function ObligationForm({ onSubmit, onCancel, initialName = '', initialGo
           onChange={(e) => setGoal(e.target.value)}
           placeholder="Enter weekly goal in hours"
           required
-          min="1"
+          min="0.1"
+          step="0.1"
         />
       </div>
       <div className="flex justify-end space-x-2">
